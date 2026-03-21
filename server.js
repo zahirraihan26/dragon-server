@@ -4,32 +4,14 @@ import dotenv from 'dotenv';
 import axios from 'axios';
 
 dotenv.config();
+
 const app = express();
 const PORT = process.env.PORT || 5000;
+
 app.use(cors());
 app.use(express.json());
 
-// --- Simple in-memory cache ---
-const newsCache = {}; // key = category_page, value = articles array
-const CACHE_TTL = 1000 * 60 * 5; // 5 minutes
-
-// --- Retry helper ---
-const axiosRetry = async (url, retries = 3, delay = 1000) => {
-    for (let i = 0; i < retries; i++) {
-        try {
-            return await axios.get(url);
-        } catch (err) {
-            if (err.response?.status === 429 && i < retries - 1) {
-                console.log(`429 detected, retrying in ${delay}ms...`);
-                await new Promise(r => setTimeout(r, delay));
-            } else {
-                throw err;
-            }
-        }
-    }
-};
-
-// --- CATEGORY MAP ---
+// --- HELPER WRAPPERS ---
 const CATEGORY_MAP = {
     '0': { currents: 'general', gnews: 'general' },
     '1': { currents: 'world', gnews: 'world' },
@@ -44,14 +26,17 @@ const CATEGORY_MAP = {
     '10': { currents: 'lifestyle', gnews: 'general' }
 };
 
-// --- Mapper functions (same as before) ---
 const mapCurrentsData = (article, index) => ({
     _id: article.id || Buffer.from(article.url || article.title).toString('base64').slice(0, 12) + "cur" + index,
     category_id: 1,
     rating: { number: 4 + Math.random(), badge: "Currents Verified" },
     total_view: Math.floor(Math.random() * 1500) + 200,
     title: article.title,
-    author: { name: article.author || "Currents Source", published_date: article.published, img: `https://ui-avatars.com/api/?name=${article.author?.split(' ')[0] || 'C'}` },
+    author: {
+        name: article.author || "Currents Source",
+        published_date: article.published,
+        img: `https://ui-avatars.com/api/?name=${article.author?.split(' ')[0] || 'C'}`
+    },
     thumbnail_url: article.image !== "None" ? article.image : "https://images.unsplash.com/photo-1504711434969-e33886168f5c",
     image_url: article.image !== "None" ? article.image : "https://images.unsplash.com/photo-1504711434969-e33886168f5c",
     details: article.description || article.content || "",
@@ -67,7 +52,11 @@ const mapGNewsData = (article, index) => ({
     rating: { number: 4 + Math.random(), badge: "GNews Verified" },
     total_view: Math.floor(Math.random() * 2000) + 500,
     title: article.title,
-    author: { name: article.source?.name || "GNews Source", published_date: article.publishedAt, img: `https://ui-avatars.com/api/?name=${article.source?.name?.split(' ')[0] || 'G'}` },
+    author: {
+        name: article.source?.name || "GNews Source",
+        published_date: article.publishedAt,
+        img: `https://ui-avatars.com/api/?name=${article.source?.name?.split(' ')[0] || 'G'}`
+    },
     thumbnail_url: article.image || "https://images.unsplash.com/photo-1495020689067-9588ac2ed155",
     image_url: article.image || "https://images.unsplash.com/photo-1495020689067-9588ac2ed155",
     details: article.content || article.description || "",
@@ -77,27 +66,21 @@ const mapGNewsData = (article, index) => ({
     api_source: "gnews"
 });
 
-// --- NEWS ROUTE ---
+// --- NEWS PROXY ROUTE ---
 app.get('/api/news/:id', async (req, res) => {
     const catId = req.params.id || "0";
     const catConfig = CATEGORY_MAP[catId] || CATEGORY_MAP["0"];
+
+    // Pagination params
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 15;
 
-    const cacheKey = `${catId}_${page}_${limit}`;
-    const now = Date.now();
-
-    // Serve from cache if available
-    if (newsCache[cacheKey] && (now - newsCache[cacheKey].timestamp < CACHE_TTL)) {
-        return res.json(newsCache[cacheKey].data);
-    }
-
     let combinedArticles = [];
 
-    // --- Currents API ---
     try {
+        // Currents API
         const currentsUrl = `${process.env.VITE_CURRENTS_BASE_URL}/search?category=${catConfig.currents}&language=en&apiKey=${process.env.VITE_CURRENTS_API_KEY}`;
-        const currentsRes = await axiosRetry(currentsUrl, 3, 1200);
+        const currentsRes = await axios.get(currentsUrl);
         if (currentsRes.data.status === "ok" && currentsRes.data.news) {
             combinedArticles = currentsRes.data.news.map(mapCurrentsData);
         }
@@ -105,8 +88,8 @@ app.get('/api/news/:id', async (req, res) => {
         console.warn("Currents API failed:", err.message);
     }
 
-    // --- GNews API ---
     try {
+        // GNews API
         const gnewsUrl = `${process.env.VITE_GNEWS_BASE_URL}/top-headlines?category=${catConfig.gnews}&lang=en&apikey=${process.env.VITE_GNEWS_API_KEY}`;
         const gnewsRes = await axios.get(gnewsUrl);
         if (gnewsRes.data.articles) {
@@ -117,23 +100,47 @@ app.get('/api/news/:id', async (req, res) => {
         console.warn("GNews API failed:", err.message);
     }
 
-    // Deduplicate & sort
+    // De-duplicate & Sort
     const uniqueArticles = Array.from(new Map(combinedArticles.map(a => [a.title?.toLowerCase(), a])).values());
-    const sorted = uniqueArticles.sort((a, b) => new Date(b.author.published_date) - new Date(a.author.published_date));
+    const sorted = uniqueArticles.sort((a, b) => {
+        const dateA = new Date(a.author.published_date || 0);
+        const dateB = new Date(b.author.published_date || 0);
+        return dateB - dateA;
+    });
 
-    // Pagination
+    // Apply Pagination
     const startIndex = (page - 1) * limit;
     const paginatedArticles = sorted.slice(startIndex, startIndex + limit);
 
-    const response = { data: paginatedArticles, total: sorted.length, page, limit };
-
-    // Save to cache
-    newsCache[cacheKey] = { data: response, timestamp: now };
-
-    res.json(response);
+    res.json({
+        data: paginatedArticles,
+        total: sorted.length,
+        page,
+        limit
+    });
 });
 
-// --- Other routes (Weather, etc.) ---
-// Same as your previous code...
+// --- WEATHER PROXY ROUTE ---
+app.get('/api/weather', async (req, res) => {
+    const { lat, lon, city } = req.query;
+    let url;
+
+    if (lat && lon) {
+        url = `https://api.openweathermap.org/data/2.5/weather?lat=${lat}&lon=${lon}&appid=${process.env.VITE_OPENWEATHER_API_KEY}&units=metric`;
+    } else {
+        url = `https://api.openweathermap.org/data/2.5/weather?q=${city || 'Dhaka'}&appid=${process.env.VITE_OPENWEATHER_API_KEY}&units=metric`;
+    }
+
+    try {
+        const response = await axios.get(url);
+        res.json(response.data);
+    } catch (err) {
+        res.status(500).json({ error: "Weather fetch failed", message: err.message });
+    }
+});
+
+app.get('/', (req, res) => res.send('Dragon News Proxy Server Active'));
 
 app.listen(PORT, () => console.log(`Backend Neural Proxy running on port ${PORT}`));
+
+
