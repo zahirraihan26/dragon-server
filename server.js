@@ -11,6 +11,10 @@ const PORT = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
+// --- CACHE & CONFIG ---
+const NEWS_CACHE = {};
+const CACHE_TTL = 10 * 60 * 1000; // 10 minutes cache
+
 // --- HELPER WRAPPERS ---
 const CATEGORY_MAP = {
     '0': { currents: 'general', gnews: 'general' },
@@ -73,8 +77,29 @@ app.get('/api/news/:id', async (req, res) => {
 
     // Pagination params
     const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 15;
+    const limit = parseInt(req.query.limit) || 10;
 
+    const cacheKey = catId;
+    const now = Date.now();
+
+    // Check Cache
+    if (NEWS_CACHE[cacheKey] && (now - NEWS_CACHE[cacheKey].timestamp < CACHE_TTL)) {
+        console.log(`[CACHE HIT] Serving news for category ${catId} from memory`);
+        const sorted = NEWS_CACHE[cacheKey].articles;
+        const startIndex = (page - 1) * limit;
+        const paginatedArticles = sorted.slice(startIndex, startIndex + limit);
+
+        return res.json({
+            data: paginatedArticles,
+            total: sorted.length,
+            page,
+            limit,
+            cache: true,
+            expiresIn: Math.floor((CACHE_TTL - (now - NEWS_CACHE[cacheKey].timestamp)) / 1000)
+        });
+    }
+
+    console.log(`[CACHE MISS] Fetching fresh news for category ${catId} from APIs`);
     let combinedArticles = [];
 
     try {
@@ -107,6 +132,12 @@ app.get('/api/news/:id', async (req, res) => {
         const dateB = new Date(b.author.published_date || 0);
         return dateB - dateA;
     });
+
+    // Update Cache
+    NEWS_CACHE[cacheKey] = {
+        timestamp: now,
+        articles: sorted
+    };
 
     // Apply Pagination
     const startIndex = (page - 1) * limit;
@@ -142,5 +173,3 @@ app.get('/api/weather', async (req, res) => {
 app.get('/', (req, res) => res.send('Dragon News Proxy Server Active'));
 
 app.listen(PORT, () => console.log(`Backend Neural Proxy running on port ${PORT}`));
-
-
